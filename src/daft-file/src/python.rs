@@ -164,6 +164,7 @@ impl PyDaftFile {
         let current_position = self.inner.position;
         let current_size = cursor.size();
 
+        #[allow(clippy::type_complexity)]
         let result: Result<(Vec<u8>, usize, bool, FileCursor), (PyErr, FileCursor)> = py.detach(move || {
             if size == -1 {
                 let mut buffer = Vec::new();
