@@ -16,7 +16,10 @@ use pyo3::{
 
 use crate::file::{DaftFile, FileCursor};
 
-#[pyclass(from_py_object)]
+type ReadResult = Result<(Vec<u8>, usize, bool, FileCursor), (PyErr, FileCursor)>;
+type SeekResult = Result<(u64, FileCursor), (PyErr, FileCursor)>;
+
+#[pyclass]
 #[derive(Clone)]
 struct PyFileReference {
     inner: Arc<FileReference>,
@@ -32,7 +35,7 @@ impl PyFileReference {
 
     pub fn __enter__(&self, py: Python<'_>) -> PyResult<PyDaftFile> {
         let file_ref = self.inner.as_ref().clone();
-        py.detach(move || Ok(DaftFile::load_blocking(file_ref, true, None)?.into()))
+        py.detach(move || Ok(DaftFile::load_blocking(file_ref, true)?.into()))
     }
 
     pub fn _get_file(&self) -> FileReference {
@@ -91,19 +94,6 @@ impl PyFileReference {
         // If all else fails, return the full URL
         Ok(url.clone())
     }
-
-    fn position(&self) -> PyResult<Option<u64>> {
-        Ok(self.inner.position)
-    }
-
-    fn size(&self) -> PyResult<Option<u64>> {
-        Ok(self.inner.size)
-    }
-
-    fn exists(&self, py: Python<'_>) -> PyResult<bool> {
-        let file_ref = self.inner.as_ref().clone();
-        py.detach(move || crate::meta::file_exists_blocking(file_ref).map_err(|e| e.into()))
-    }
 }
 
 #[pyclass]
@@ -147,10 +137,9 @@ impl PyDaftFile {
 #[pymethods]
 impl PyDaftFile {
     #[staticmethod]
-    #[pyo3(signature=(f, buffer_size=None))]
-    fn _from_file_reference(py: Python<'_>, f: PyFileReference, buffer_size: Option<usize>) -> PyResult<Self> {
+    fn _from_file_reference(py: Python<'_>, f: PyFileReference) -> PyResult<Self> {
         let file_ref = f.inner.as_ref().clone();
-        py.detach(move || Ok(DaftFile::load_blocking(file_ref, false, buffer_size)?.into()))
+        py.detach(move || Ok(DaftFile::load_blocking(file_ref, false)?.into()))
     }
 
     #[pyo3(signature=(size=-1))]
@@ -164,6 +153,7 @@ impl PyDaftFile {
         let current_position = self.inner.position;
         let current_size = cursor.size();
 
+        #[allow(clippy::type_complexity)]
         let result: Result<(Vec<u8>, usize, bool, FileCursor), (PyErr, FileCursor)> = py.detach(move || {
             if size == -1 {
                 let mut buffer = Vec::new();
@@ -227,6 +217,7 @@ impl PyDaftFile {
             .take()
             .ok_or_else(|| PyValueError::new_err("File not open"))?;
 
+        #[allow(clippy::type_complexity)]
         let result: Result<(u64, FileCursor), (PyErr, FileCursor)> = py.detach(move || {
             match cursor.seek(seek_from) {
                 Ok(new_pos) => Ok((new_pos, cursor)),
