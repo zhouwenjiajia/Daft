@@ -259,6 +259,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_joinable_forwarding_stream_error_allows_remaining_tasks_to_cleanup() {
+        let (release_cleanup_tx, release_cleanup_rx) = tokio::sync::oneshot::channel();
+        let (cleanup_done_tx, cleanup_done_rx) = tokio::sync::oneshot::channel();
+
+        let mut joinset = JoinSet::new();
+        joinset.spawn(async move { Err(DaftError::InternalError("test error".to_string())) });
+        joinset.spawn(async move {
+            release_cleanup_rx.await.unwrap();
+            cleanup_done_tx.send(()).unwrap();
+            Ok(())
+        });
+
+        // Ensure the error is ready while the cleanup task remains blocked.
+        tokio::task::yield_now().await;
+
+        let mut stream = JoinableForwardingStream::new(futures::stream::empty::<usize>(), joinset);
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("background error should be surfaced")
+            .expect("stream should emit an error item");
+        assert!(result.unwrap_err().to_string().contains("test error"));
+
+        release_cleanup_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cleanup_done_rx)
+            .await
+            .expect("remaining background tasks should not be aborted")
+            .expect("cleanup task should finish normally");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_joinable_forwarding_stream_basic_error() {
         let (tx, rx) = create_channel(1);
 
