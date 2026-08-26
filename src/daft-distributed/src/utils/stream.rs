@@ -99,10 +99,9 @@ where
                     }
 
                     if let Some(error) = background_error {
-                        let remaining_tasks = joinset
-                            .take()
-                            .expect("JoinSet should exist while polling background tasks");
-                        *state = ForwardingStreamState::AwaitingTasks(remaining_tasks);
+                        if joinset.as_ref().is_some_and(JoinSet::is_empty) {
+                            *state = ForwardingStreamState::Complete;
+                        }
                         return Some(Poll::Ready(Some(Err(error))));
                     }
 
@@ -291,9 +290,9 @@ mod tests {
             }
         }
         assert!(stream.next().await.is_none());
-        // The stream should fail fast once a background task errors instead of draining
-        // all remaining input items first.
-        assert!(count < 9);
+        // The error is surfaced while the input stream and remaining tasks can still
+        // finish their normal cleanup path.
+        assert_eq!(count, 9);
     }
 
     #[tokio::test]
@@ -328,8 +327,8 @@ mod tests {
             }
         }
         assert!(stream.next().await.is_none());
-        // The stream should fail fast once a background task panics instead of draining
-        // all remaining input items first.
-        assert!(count < 9);
+        // The panic is surfaced while the input stream and remaining tasks can still
+        // finish their normal cleanup path.
+        assert_eq!(count, 9);
     }
 }
