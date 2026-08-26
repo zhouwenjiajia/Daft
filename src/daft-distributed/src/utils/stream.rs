@@ -58,7 +58,23 @@ where
                     input_stream,
                     joinset,
                 } => {
+                    match input_stream.poll_next_unpin(cx) {
+                        // Preserve the existing input priority when data is ready.
+                        Poll::Ready(Some(result)) => return Some(Poll::Ready(Some(Ok(result)))),
+                        // Input stream is done, transition to awaiting tasks.
+                        Poll::Ready(None) => {
+                            *state = match joinset.take() {
+                                Some(joinset) => ForwardingStreamState::AwaitingTasks(joinset),
+                                None => ForwardingStreamState::Complete,
+                            };
+                            return None;
+                        }
+                        // Register the input waker before checking background tasks.
+                        Poll::Pending => {}
+                    }
+
                     let mut joinset_complete = false;
+                    let mut background_error = None;
                     if let Some(active_joinset) = joinset.as_mut() {
                         loop {
                             match active_joinset.poll_join_next(cx) {
@@ -66,14 +82,12 @@ where
                                 // tasks register this stream's waker before we return Pending.
                                 Poll::Ready(Some(Ok(Ok(())))) => {}
                                 Poll::Ready(Some(Ok(Err(e)))) => {
-                                    active_joinset.abort_all();
-                                    *state = ForwardingStreamState::Complete;
-                                    return Some(Poll::Ready(Some(Err(e))));
+                                    background_error = Some(e);
+                                    break;
                                 }
                                 Poll::Ready(Some(Err(e))) => {
-                                    active_joinset.abort_all();
-                                    *state = ForwardingStreamState::Complete;
-                                    return Some(Poll::Ready(Some(Err(e))));
+                                    background_error = Some(e);
+                                    break;
                                 }
                                 Poll::Ready(None) => {
                                     joinset_complete = true;
@@ -83,40 +97,27 @@ where
                             }
                         }
                     }
+
+                    if let Some(error) = background_error {
+                        let remaining_tasks = joinset
+                            .take()
+                            .expect("JoinSet should exist while polling background tasks");
+                        *state = ForwardingStreamState::AwaitingTasks(remaining_tasks);
+                        return Some(Poll::Ready(Some(Err(error))));
+                    }
+
                     if joinset_complete {
                         *joinset = None;
                     }
-
-                    match input_stream.poll_next_unpin(cx) {
-                        // Received a result from the stream, forward it.
-                        Poll::Ready(Some(result)) => Some(Poll::Ready(Some(Ok(result)))),
-                        // Input stream is done, transition to awaiting tasks.
-                        Poll::Ready(None) => {
-                            *state = match joinset.take() {
-                                Some(joinset) => ForwardingStreamState::AwaitingTasks(joinset),
-                                None => ForwardingStreamState::Complete,
-                            };
-                            None
-                        }
-                        // Still waiting for more results from the stream.
-                        Poll::Pending => Some(Poll::Pending),
-                    }
+                    Some(Poll::Pending)
                 }
                 // AwaitingTasks: Input stream is done, awaiting background tasks to complete
                 ForwardingStreamState::AwaitingTasks(joinset) => match joinset.poll_join_next(cx) {
                     // Received a result from a background task
                     Poll::Ready(Some(result)) => match result {
                         Ok(Ok(())) => None,
-                        Ok(Err(e)) => {
-                            joinset.abort_all();
-                            *state = ForwardingStreamState::Complete;
-                            Some(Poll::Ready(Some(Err(e))))
-                        }
-                        Err(e) => {
-                            joinset.abort_all();
-                            *state = ForwardingStreamState::Complete;
-                            Some(Poll::Ready(Some(Err(e))))
-                        }
+                        Ok(Err(e)) => Some(Poll::Ready(Some(Err(e)))),
+                        Err(e) => Some(Poll::Ready(Some(Err(e)))),
                     },
                     // All background tasks are complete
                     Poll::Ready(None) => {
