@@ -9,6 +9,7 @@ on:
       - verify/7396-control
       - verify/7396-current-fix
       - verify/7396-candidate-fix
+      - verify/7396-final-state-machine
   workflow_dispatch:
 
 env:
