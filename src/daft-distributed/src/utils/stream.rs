@@ -14,7 +14,7 @@ enum ForwardingStreamState<S: Stream + Send + Unpin + 'static> {
         input_stream: S,
         joinset: Option<JoinSet<DaftResult<()>>>,
     },
-    // AwaitingTasks: Input stream is done, awaiting background tasks to complete
+    // AwaitingTasks: Input forwarding has stopped, awaiting background tasks to complete
     AwaitingTasks(JoinSet<DaftResult<()>>),
     // Complete: Both stream and background tasks are finished
     Complete,
@@ -99,9 +99,10 @@ where
                     }
 
                     if let Some(error) = background_error {
-                        if joinset.as_ref().is_some_and(JoinSet::is_empty) {
-                            *state = ForwardingStreamState::Complete;
-                        }
+                        // Stop forwarding input, but retain the remaining tasks so they can
+                        // observe the closed input channel and complete their cleanup paths.
+                        let joinset = joinset.take().expect("JoinSet should exist");
+                        *state = ForwardingStreamState::AwaitingTasks(joinset);
                         return Some(Poll::Ready(Some(Err(error))));
                     }
 
@@ -290,6 +291,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_joinable_forwarding_stream_active_error_stops_input_and_keeps_cleanup_running() {
+        let (input_tx, input_rx) = create_channel(1);
+        let (release_cleanup_tx, release_cleanup_rx) = tokio::sync::oneshot::channel();
+        let (cleanup_done_tx, cleanup_done_rx) = tokio::sync::oneshot::channel();
+
+        let mut joinset = JoinSet::new();
+        joinset.spawn(async move { Err(DaftError::InternalError("test error".to_string())) });
+        joinset.spawn(async move {
+            release_cleanup_rx.await.unwrap();
+            cleanup_done_tx.send(()).unwrap();
+            Ok(())
+        });
+
+        tokio::task::yield_now().await;
+
+        let mut stream = JoinableForwardingStream::new(
+            tokio_stream::wrappers::ReceiverStream::new(input_rx),
+            joinset,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("background error should be surfaced while input is pending")
+            .expect("stream should emit an error item");
+        assert!(result.unwrap_err().to_string().contains("test error"));
+
+        // The input receiver is dropped as part of fail-fast, while cleanup tasks keep
+        // running independently even if the consumer does not poll the stream again.
+        assert!(input_tx.send(1).await.is_err());
+        release_cleanup_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cleanup_done_rx)
+            .await
+            .expect("remaining background tasks should continue without another stream poll")
+            .expect("cleanup task should finish normally");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_joinable_forwarding_stream_preserves_ready_input_before_background_error() {
+        let mut joinset = JoinSet::new();
+        joinset.spawn(async move { Err(DaftError::InternalError("test error".to_string())) });
+        tokio::task::yield_now().await;
+
+        let mut stream = JoinableForwardingStream::new(futures::stream::iter([42usize]), joinset);
+        assert_eq!(stream.next().await.unwrap().unwrap(), 42);
+        assert!(
+            stream
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("test error")
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_joinable_forwarding_stream_basic_error() {
         let (tx, rx) = create_channel(1);
 
@@ -299,8 +357,8 @@ mod tests {
             joinset.spawn(async move {
                 if i == 5 {
                     return Err(DaftError::InternalError("test error".to_string()));
-                } else {
-                    tx.send(1).await.unwrap();
+                } else if tx.send(1).await.is_err() {
+                    return Ok(());
                 }
                 Ok(())
             });
@@ -311,19 +369,20 @@ mod tests {
             JoinableForwardingStream::new(tokio_stream::wrappers::ReceiverStream::new(rx), joinset);
 
         let mut count = 0;
+        let mut saw_error = false;
         while let Some(result) = stream.next().await {
             if let Err(e) = result {
                 assert!(matches!(e, DaftError::InternalError(_)));
                 assert!(e.to_string().contains("test error"));
+                saw_error = true;
             } else {
                 assert_eq!(result.unwrap(), 1);
                 count += 1;
             }
         }
         assert!(stream.next().await.is_none());
-        // The error is surfaced while the input stream and remaining tasks can still
-        // finish their normal cleanup path.
-        assert_eq!(count, 9);
+        assert!(saw_error);
+        assert!(count <= 9);
     }
 
     #[tokio::test]
@@ -336,8 +395,8 @@ mod tests {
             joinset.spawn(async move {
                 if i == 5 {
                     panic!("test panic");
-                } else {
-                    tx.send(1).await.unwrap();
+                } else if tx.send(1).await.is_err() {
+                    return Ok(());
                 }
                 Ok(())
             });
@@ -348,18 +407,19 @@ mod tests {
             JoinableForwardingStream::new(tokio_stream::wrappers::ReceiverStream::new(rx), joinset);
 
         let mut count = 0;
+        let mut saw_panic = false;
         while let Some(result) = stream.next().await {
             if let Err(e) = result {
                 assert!(matches!(e, DaftError::JoinError(_)));
                 assert!(e.to_string().contains("test panic"));
+                saw_panic = true;
             } else {
                 assert_eq!(result.unwrap(), 1);
                 count += 1;
             }
         }
         assert!(stream.next().await.is_none());
-        // The panic is surfaced while the input stream and remaining tasks can still
-        // finish their normal cleanup path.
-        assert_eq!(count, 9);
+        assert!(saw_panic);
+        assert!(count <= 9);
     }
 }
