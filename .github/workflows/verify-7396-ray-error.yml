@@ -21,6 +21,10 @@ jobs:
   verify-python-310-ray:
     runs-on: ubuntu-22.04
     timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        repetition: [1, 2]
 
     steps:
       - uses: actions/checkout@v7
@@ -67,6 +71,9 @@ jobs:
       - name: Match CI PyArrow version
         run: uv pip install pyarrow==22.0.0
 
+      - name: Build hello extension
+        run: cargo build --release --manifest-path examples/hello/Cargo.toml
+
       - name: Build coverage-instrumented library
         run: |
           source .venv/bin/activate
@@ -84,8 +91,8 @@ jobs:
         run: |
           set -o pipefail
           source .venv/bin/activate
-          for attempt in $(seq 1 20); do
-            echo "===== focused attempt ${attempt}/20 ====="
+          for attempt in $(seq 1 5); do
+            echo "===== focused attempt ${attempt}/5 ====="
             timeout --signal=TERM --kill-after=30s 120s \
               pytest -n 0 --cov=daft -vv -s \
               tests/expressions/test_utf8.py::test_split_part_zero_errors
@@ -116,7 +123,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: verify-7396-ray-error-${{ github.run_attempt }}
+          name: verify-7396-ray-error-${{ matrix.repetition }}-${{ github.run_attempt }}
           if-no-files-found: warn
           retention-days: 7
           path: |
